@@ -139,19 +139,21 @@ class FeedForward(Module):
         self.norm = LayerNorm(dim)
 
         self.net = nn.Sequential(
-            nn.Linear(dim, inner_dim),   # 扩展维度
+            nn.Linear(dim, inner_dim),    # 扩展维度
             nn.GELU(),                    # GELU 激活函数
             nn.Dropout(dropout),          # Dropout 正则化
             nn.Linear(inner_dim, dim),    # 投影回原始维度
             nn.Dropout(dropout)           # Dropout 正则化
         )
     def forward(self, x, cond_fn = None):
+        # 尺寸为 [B,N,dim]
         x = self.norm(x)
 
         if exists(cond_fn):
             # 自适应层归一化：cond_fn 对归一化后的特征进行条件变换
             x = cond_fn(x)
 
+        # 尺寸为 [B,N,dim]
         return self.net(x)
 
 # ============================================================================
@@ -210,6 +212,7 @@ class MBConvResidual(Module):
 
     def forward(self, x):
         out = self.fn(x)
+        # 训练时：每个残差块以概率 p 被跳过（即仅执行恒等映射）。这样，网络在每次前向传播时都只有随机的子集被激活，强迫网络不依赖任何特定层，类似于训练一个隐式的深度集成。
         out = self.dropsample(out)  # 随机深度正则化
         return out + x
 
@@ -270,14 +273,16 @@ def MBConv(
     stride = 2 if downsample else 1
 
     net = nn.Sequential(
-        nn.Conv2d(dim_in, hidden_dim, 1),                                       # 1×1 扩展卷积
+        nn.Conv2d(dim_in, hidden_dim, 1),                              # 1×1 扩展卷积
         nn.BatchNorm2d(hidden_dim),                                              # 批归一化
         nn.GELU(),                                                               # GELU 激活
         nn.Conv2d(hidden_dim, hidden_dim, 3, stride = stride, padding = 1, groups = hidden_dim),  # 3×3 深度可分离卷积
         nn.BatchNorm2d(hidden_dim),                                              # 批归一化
         nn.GELU(),                                                               # GELU 激活
+        # 通道注意力机制，让网络自适应地重新校准每个通道的重要性——重要的通道放大，不重要的通道抑制。
+        # SE 模块在深度可分离卷积之后加入通道注意力，可以进一步提升模型的表征能力，且增加的参数量很小
         SqueezeExcitation(hidden_dim, shrinkage_rate = shrinkage_rate),          # 挤压-激励注意力
-        nn.Conv2d(hidden_dim, dim_out, 1),                                       # 1×1 投影卷积
+        nn.Conv2d(hidden_dim, dim_out, 1),                             # 1×1 投影卷积
         nn.BatchNorm2d(dim_out)                                                  # 批归一化
     )
 
@@ -351,8 +356,10 @@ class Attention(Module):
         pos = torch.arange(window_size)
         grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))           # (2, w, w)
         grid = rearrange(grid, 'c i j -> (i j) c')                              # (w*w, 2)，每个位置的 (x,y) 坐标
+        # 计算所有位置对的相对坐标
         rel_pos = rearrange(grid, 'i ... -> i 1 ...') - rearrange(grid, 'j ... -> 1 j ...')  # (w*w, w*w, 2)，成对相对坐标
         rel_pos += window_size - 1                                              # 偏移到非负范围 [0, 2*w-2]
+        # 行优先线性映射，将二维网格 (dx, dy) 中的每个格点映射到唯一的整数 0 ~ (2w-1)^2 - 1
         rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim = -1)   # 将二维相对坐标编码为一维索引
 
         # 注册为不可训练的 buffer
@@ -362,6 +369,7 @@ class Attention(Module):
         # x 形状: (batch, x_blocks, y_blocks, window_h, window_w, dim)
         batch, height, width, window_height, window_width, _, device, h = *x.shape, x.device, self.heads
 
+        # 尺寸为 (batch, x_blocks, y_blocks, window_h, window_w, dim)
         x = self.norm(x)
 
         # 将块维度展平: (b, x, y, w1, w2, d) → (b*x*y, w1*w2, d)
@@ -370,41 +378,51 @@ class Attention(Module):
         # QKV 投影并沿最后一维切分为 Q、K、V
         q, k, v = self.to_qkv(x).chunk(3, dim = -1)
 
-        # 拆分为多头: (b, n, h*d_head) → (b, h, n, d_head)
+        # 拆分为多头: (b*x*y, w1*w2, h*d_head) → (b*x*y, h, w1*w2, d_head)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
         # 缩放 Q
         q = q * self.scale
 
         # 记忆/寄存器 KV token：在每个注意力计算中添加可学习的全局 token
+        # 尺寸为 (b*x*y, h, num_mem_kv, d_head)
         mk, mv = map(lambda t: repeat(t, 'h n d -> b h n d', b = q.shape[0]),  self.mem_kv)
         num_mem = mk.shape[-2]
 
         # 将记忆 token 拼接到 K 和 V 前面
+        # 尺寸为 (b*x*y, h, num_mem_kv + w1*w2, d_head)
         k = torch.cat((mk, k), dim = -2)
+        # 尺寸为 (b*x*y, h, num_mem_kv + w1*w2, d_head)
         v = torch.cat((mv, v), dim = -2)
 
         # 计算注意力分数: Q · K^T
+        # 尺寸为 (b*x*y, h, w1*w2, num_mem_kv + w1*w2)
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
 
         # 添加相对位置偏置
+        # 尺寸为 (w1*w2, w1*w2, h)
         bias = self.rel_pos_bias(self.rel_pos_indices)
         # 为记忆 token 在偏置前面填充 0（记忆 token 无位置偏置）
+        # 尺寸为 (w1*w2, num_mem_kv + w1*w2, h)
         bias = F.pad(bias, (0, 0, num_mem, 0), value = 0.)
+        # 尺寸为 (b*x*y, h, w1*w2, num_mem_kv + w1*w2)
         sim = sim + rearrange(bias, 'i j h -> h i j')
 
         # Softmax + Dropout 得到注意力权重
+        # 尺寸为 (b*x*y, h, w1*w2, num_mem_kv + w1*w2)
         attn = self.attend(sim)
 
         # 加权聚合 V: attn @ V
+        # 尺寸为 (b*x*y, h, w1*w2, d_head)
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
-        # 合并多头并恢复窗口形状: (b, h, w1*w2, d) → (b, w1, w2, h*d)
+        # 合并多头并恢复窗口形状: (b*x*y, h, w1*w2, d_head) → (b*x*y, w1, w2, h*d_head)
         out = rearrange(out, 'b h (w1 w2) d -> b w1 w2 (h d)', w1 = window_height, w2 = window_width)
 
         # 输出投影
+        # 尺寸为 (b*x*y, w1, w2, h*d_head)
         out = self.to_out(out)
-        # 恢复块维度: (b*x*y, w1, w2, d) → (b, x, y, w1, w2, d)
+        # 恢复块维度: (b*x*y, w1, w2, d) → (b, x, y, w1, w2, h*d_head)
         return rearrange(out, '(b x y) ... -> b x y ...', x = height, y = width)
 
 class MaxViT(Module):
@@ -472,7 +490,7 @@ class MaxViT(Module):
 
         w = window_size   # 窗口大小
 
-        # 记录每个块输入的条件隐藏维度（用于 TextConditioner 配置）
+        # 记录每个阶段内各个块输入的条件隐藏维度（用于 TextConditioner 配置）
         cond_hidden_dims = []
 
         # --- 构建各阶段 ---
@@ -481,6 +499,7 @@ class MaxViT(Module):
                 is_first = stage_ind == 0
                 stage_dim_in = layer_dim_in if is_first else layer_dim
 
+                # 每个阶段内各个块的输入维度
                 cond_hidden_dims.append(stage_dim_in)
 
                 block = nn.Sequential(
@@ -492,8 +511,10 @@ class MaxViT(Module):
                         expansion_rate = mbconv_expansion_rate,
                         shrinkage_rate = mbconv_shrinkage_rate
                     ),
+
                     # 2. Block Attention（窗口内自注意力）
-                    # 将特征图切分为 w×w 的窗口
+                    # 将特征图切分为 w×w 的窗口，每个窗口包含 空间上相邻 的 w×w 个像素/特征点
+                    # 让注意力在局部区域内进行，捕获 细节、纹理、边缘 等局部特征，类似卷积的局部感受野，但通过自注意力实现更灵活的交互。
                     Rearrange('b d (x w1) (y w2) -> b x y w1 w2 d', w1 = w, w2 = w),
                     Residual(Attention(dim = layer_dim, dim_head = dim_head, dropout = dropout, window_size = w)),
                     Residual(FeedForward(dim = layer_dim, dropout = dropout)),
@@ -501,6 +522,8 @@ class MaxViT(Module):
 
                     # 3. Grid Attention（网格自注意力）
                     # 另一种切分方式，与 Block Attention 互为补充
+                    # 将高度 H 和宽度 W 按 等间隔采样 的方式划分，每个网格中的元素来自原图中 周期性的位置
+                    # 让注意力在 全局稀疏网格 上交互，捕获 长距离依赖、周期性结构、全局布局。与局部窗口互补，可以看作是一种高效的全局长程注意力近似。
                     Rearrange('b d (w1 x) (w2 y) -> b x y w1 w2 d', w1 = w, w2 = w),
                     Residual(Attention(dim = layer_dim, dim_head = dim_head, dropout = dropout, window_size = w)),
                     Residual(FeedForward(dim = layer_dim, dropout = dropout)),
@@ -543,6 +566,7 @@ class MaxViT(Module):
             分类 logits (B, num_classes) 或嵌入特征 (B, embed_dim, H', W')
         """
         # 卷积干提取初始特征
+        # 尺寸为[B, C_conv, H/2, W/2]
         x = self.conv_stem(x)
 
         # 将条件函数列表转换为迭代器
@@ -555,12 +579,15 @@ class MaxViT(Module):
             if exists(cond_fn):
                 x = cond_fn(x)   # 自适应条件变换（用于文本引导等）
 
+            # MBConv + Block Attention + Grid Attention
+            # 尺寸为[B,d,h,w]
             x = stage(x)
 
         if return_embeddings:
             return x
 
         # MLP 头输出分类结果
+        # 尺寸为[B, num_classes]
         return self.mlp_head(x)
 
 # ============================================================================
@@ -642,20 +669,24 @@ class TransformerAttention(Module):
 
         # 对上下文进行归一化
         if exists(context):
+            # 尺寸为[B, N_ctx, dim_context]
             context = self.context_norm(context)
 
         # 若没有提供 context，则使用自注意力（KV 来自 x）
         kv_input = default(context, x)
 
+        # 尺寸为[B, N, dim]
         x = self.norm(x)
 
         # 自适应层归一化（用于分类器自由引导等条件控制）
         if exists(cond_fn):
+            # 尺寸为[B, N, dim]
             x = cond_fn(x)
 
         # Q 投影: (B, N, dim) → (B, N, inner_dim)
         q = self.to_q(x)
         # KV 投影并拆分
+        # 尺寸为[B, N, dim_head]
         k, v = self.to_kv(kv_input).chunk(2, dim = -1)
 
         # Q 拆分为多头: (B, N, inner_dim) → (B, heads, N, dim_head)
@@ -665,6 +696,7 @@ class TransformerAttention(Module):
         q = q * self.scale
 
         # 计算注意力分数: Q · K^T，K 保持 (B, N, dim_head) 格式用于高效计算
+        # 尺寸为[B, heads, N_q, N_kv]
         sim = einsum('b h i d, b j d -> b h i j', q, k)
 
         # 应用各种掩码和偏置
@@ -684,18 +716,22 @@ class TransformerAttention(Module):
         if self.causal:
             # 上三角掩码：位置 i 只能看到位置 j ≤ i
             i, j = sim.shape[-2:]
+            # False 表示保留
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = x.device).triu(j - i + 1)
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         # Softmax + Dropout
+        # 尺寸为[B, heads, N_q, N_kv]
         attn = sim.softmax(dim = -1)
         attn = self.attn_dropout(attn)
 
         # 加权聚合: attn @ V
+        # 尺寸为[B, heads, N_q, dim_head]
         out = einsum('b h i j, b j d -> b h i d', attn, v)
 
         # 合并多头: (B, heads, N, dim_head) → (B, N, inner_dim)
         out = rearrange(out, 'b h n d -> b n (h d)')
+        # 尺寸为 [B, N, dim]
         return self.to_out(out)
 
 class Transformer(Module):
@@ -748,8 +784,10 @@ class Transformer(Module):
 
         for attn, ff in self.layers:
              # 注意力子层 + 残差连接
+             # 尺寸为[B, N, dim]
              x = attn(x, attn_mask = attn_mask, cond_fn = next(cond_fns, None)) + x
              # 前馈子层 + 残差连接
+             # 尺寸为[B, N, dim]
              x = ff(x, cond_fn = next(cond_fns, None)) + x
         return x
 
@@ -773,7 +811,7 @@ class TokenLearner(Module):
 
     前向传播:
         x: 特征图 (B, C, H, W) 或任意前缀形状
-        输出: 学习到的 token (B, num_output_tokens, C)
+        输出: 学习到的 token (B, C, num_output_tokens)
     """
     def __init__(
         self,
@@ -861,14 +899,15 @@ class RT1(Module):
         super().__init__()
         self.vit = vit
 
-        # ViT 中的阶段数（对应 cond_hidden_dims 的长度）
+        # ViT 中的总块数（对应 cond_hidden_dims 的长度）
         self.num_vit_stages = len(vit.cond_hidden_dims)
 
         # 选择文本条件器类型
         conditioner_klass = AttentionTextConditioner if use_attn_conditioner else TextConditioner
 
         # 文本条件器：将文本嵌入映射为各层的条件向量
-        # hidden_dims 包含 ViT 各阶段和 Transformer 各层的维度
+        # hidden_dims 包含 ViT 各块和 Transformer 各层的维度
+        # 每一层 Transformer 包含 两个子模块：一个多头注意力（TransformerAttention）和一个前馈网络（FeedForward）
         # hiddens_channel_first 标记哪些层处理的是通道优先（图像）格式
         self.conditioner = conditioner_klass(
             hidden_dims = (*tuple(vit.cond_hidden_dims), *((vit.embed_dim,) * depth * 2)),
@@ -966,9 +1005,19 @@ class RT1(Module):
 
         # 生成条件函数序列
         # repeat_batch: ViT 各阶段按帧数重复（每帧独立处理），Transformer 层不重复（共享）
+        # 调用条件器（self.conditioner），为模型中的每一个需要条件控制的层生成对应的条件函数（cond_fn），并且通过 repeat_batch 参数控制每个条件函数在批量维度上的重复次数
         cond_fns, _ = self.conditioner(
             **cond_kwargs,
             cond_drop_prob = cond_drop_prob,
+            #   这个元组展开后是：
+            #   (frames, frames, ..., frames,  1, 1, ..., 1)
+            #    \_____ num_vit_stages ____/   \__ depth*2 __/
+            # 1. ViT 阶段（前 num_vit_stages 个）→ frames：
+            #     - 视频帧被展开为独立图像：(B, C, F, H, W) → (B*F, C, H, W)
+            #     - 每帧独立经过 ViT 编码，所以条件向量需要在 batch 维度上也按 frames 重复，让每一帧都收到对应的文本条件信号
+            #   2. Transformer 层（后 depth * 2 个）→ 1：
+            #     - Token Learner 之后，帧信息已经被压缩为统一的 token 序列，不再有独立的帧维度
+            #     - 所以 batch 维度保持原样，不需要重复
             repeat_batch = (*((frames,) * self.num_vit_stages), *((1,) * self.transformer_depth * 2))
         )
 
@@ -1018,3 +1067,13 @@ class RT1(Module):
         # 动作预测: (B, F, D) → (B, F, num_actions, action_bins)
         logits = self.to_logits(pooled)
         return logits
+
+if __name__ == '__main__':
+    from einops import pack, unpack, repeat, reduce, rearrange
+    import torch
+    from robotic_transformer_pytorch.robotic_transformer import pack_one
+
+    att = Attention(dim = 64)
+    input = torch.randn(1, 5, 5, 7, 7, 64)
+    output = att(input)
+    print(output.size())
